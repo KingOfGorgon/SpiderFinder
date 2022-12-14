@@ -1,0 +1,659 @@
+#!/usr/bin/python3
+# coding=utf8
+import sys
+sys.path.append('/home/pi/SpiderPi/')
+import cv2
+import copy
+import math
+import time
+import Camera
+import kinematics
+import numpy as np
+import matplotlib.pyplot as plt
+import HiwonderSDK.tm1640 as tm
+import HiwonderSDK.Board as Board
+import ArmIK.ArmMoveIK as AMK
+import HiwonderSDK.Sonar as Sonar
+from CameraCalibration.CalibrationConfig import *
+from enum import Enum
+import yaml
+
+if sys.version_info.major == 2:
+    print('Please run this program with python3!')
+    sys.exit(0)
+
+WIDTH=640
+HEIGHT=480
+
+ik = kinematics.IK()
+AK = AMK.ArmIK()
+HWSONAR = Sonar.Sonar()
+sonar_to_arm_function=None
+sonar_to_arm_file = '/home/pi/SpiderPi/sonar_to_arm_config.yaml'
+
+
+
+
+def get_distance_with_sonar():    
+    
+
+    sample_n=100
+    dist_list=[0]*sample_n
+    HWSONAR.setRGBMode(0)
+    HWSONAR.setRGB(1, (0,0,0))
+    HWSONAR.setRGB(2, (0,0,0))
+    time.sleep(1.0)
+    for check in range(sample_n*5):
+        dist_list[check%sample_n]=HWSONAR.getDistance()    
+    
+    return int(round(np.mean(dist_list)))
+
+
+def load_sonar_to_arm():
+    global sonar_to_arm_function
+    file = open(sonar_to_arm_file, 'r', encoding='utf-8')
+    file_data = file.read()
+    file.close()
+    data = yaml.safe_load(file_data)
+    teaching_coef=[ np.float64(n) for n in data]
+    print(teaching_coef)
+    sonar_to_arm_function=np.poly1d(teaching_coef)    
+
+    
+
+def train_sonar_to_arm():
+    global sonar_to_arm_function
+    close_gripper()
+    partial_crouch_stance()
+    input_list=[]
+    output_list=[]
+    #for distance in range(12, 25, 1):
+    #graph from this shows that sensor data stops being nearly linear for 22 and 23
+    for distance in range(12, 21, 1):
+        response=AK.setPitchRangeMoving((0, distance, 0), -90, -85, -95, 2000)
+        time.sleep(1)
+        if (response is not False):
+            sonar_dist=get_distance_with_sonar()
+            input_list.append(distance)
+            output_list.append(sonar_dist)
+
+    #coef=np.polyfit(input_list, output_list, 1)
+    #poly1d_fn=np.poly1d(coef)
+    #plt.plot(input_list, output_list,'yo', input_list, poly1d_fn(input_list), '--k')
+    #plt.show()
+
+    teaching_coef=np.polyfit(output_list, input_list, 1)
+    sonar_to_arm_function=np.poly1d(teaching_coef)
+    #plt.plot(output_list, input_list, 'yo', output_list, sonar_to_arm_function(output_list), '--k')
+    #plt.show()
+    data=[float(teaching_coef[i]) for i in range(len(teaching_coef))]
+    file = open(sonar_to_arm_file, 'w', encoding='utf-8')
+    yaml.dump(data, file)
+    file.close()
+    
+
+
+
+'''
+After a decent amount of experimentation, I was able to figure out the function of the
+arguements for ik.back.  I am assuming they are the same for ik.go_forward,
+ik.right_move, and ik.left_move. They are as follows
+ik.go_forward(stance, gait_style, step_size, movement_duration, cycles)
+stance - I have only tried using ik.init_pos
+gait_style can be 1,2,3, or 4
+step_size is how big the steps are
+movement_duration is how long it takes for each full gain cycle or maybe all the cycles
+cycles-this seems to be the number of full gait cycles it goes through
+
+'''
+
+def move_forward(step_size,cycles=1,gait=2):
+    ik.go_forward(current_pos, gait, step_size, 80, cycles)  # 
+
+def move_backward(step_size,cycles=1,gait=2):
+    ik.back(current_pos, gait, step_size, 80, cycles)  #
+
+
+def move_right(step_size,cycles=1,gait=2):
+    ik.right_move(current_pos, gait, step_size, 80, cycles)  #
+    
+def move_left(step_size,cycles=1,gait=2):
+    ik.left_move(current_pos, gait, step_size, 80, cycles)  # 
+
+
+
+
+'''
+i am guessing the arguments for turn_right and turn_left
+ik.turn_right(stance, gait_style, angle_of_turn, movement_duration, cycles)
+
+'''
+    
+def pivot_right(step_angle, cycles=1, gait=2):
+    print("Clockwise")
+    ik.turn_right(current_pos, gait, step_angle, 100, cycles) #Uses Tripod Gate turn 3 degrees    
+
+def pivot_left(step_angle, cycles=1, gait=2):
+    print("Counter-Clockwise")
+    ik.turn_left(current_pos, gait, step_angle, 100, cycles) #Uses Tripod Gate turn 3 degrees    
+
+    
+def open_gripper():
+    Board.setBusServoPulse(25, 120, 500)
+
+def grip_gripper():
+    Board.setBusServoPulse(25, 320, 500)
+
+def close_gripper():
+    Board.setBusServoPulse(25, 500, 500)
+
+
+stance_x=0
+stance_y=0
+stance_z=0
+
+"""
+Figuring out how to change heights was one of the greatest difficulties i faced as i could originally get
+the robot to walk in the height of the initial_pos, which messed with some of my measurments
+I figured it out while very tired and the following is my explaination
+
+This code reconstructs how the position system works but with slightly lower center of balance
+I figured it out loking at PickAction.py where they defined pos_1, pos_2, pos_3, and pos_4 and
+then thinking about how kinematics_control_demo.py explained what was actually in ik.initial_pos
+
+"""
+
+def upright_stance():
+    print("FIRM STANCE \n \n")
+    global current_pos
+    current_pos=ik.initial_pos
+    ik.stand(current_pos)
+
+
+
+def crouch_stance():
+    global current_pos
+    current_pos=[[los_pos[0],los_pos[1],los_pos[2]+50] for los_pos in ik.initial_pos]
+    ik.stand(current_pos)
+
+def partial_crouch_stance():
+    print("PARTIAL CROUCH STANCE \n \n")
+    global current_pos
+    current_pos=[[los_pos[0],los_pos[1],los_pos[2]+30] for los_pos in ik.initial_pos]
+    ik.stand(current_pos)
+
+
+
+
+def raised_stance():
+    print("Raised STANCE \n \n")
+    global current_pos
+    current_pos=[[los_pos[0],los_pos[1],los_pos[2]-10] for los_pos in ik.initial_pos]
+    ik.stand(current_pos)
+
+def lowered_stance_to_grab():
+    print("LOWERING STANCE \n \n")
+    global stance_x
+    global stance_y
+    global stance_z
+    current_pos=ik.initial_pos
+    #These stance biases would have only been changed by the final adjustments of camera based on the correction for the camera hand
+    stance_x=stance_x-20
+    stance_y=stance_y+0
+    stance_z=stance_z-40 #current_pos is already 50 higher in z that ik.initial_pos
+    print(stance_x)
+    print(stance_y)
+    print(stance_z)
+#Lower the stance but also move forward to go from having camera on target to hand on target
+    #x is forward while y is side to side
+    ik.moveBody(current_pos, [stance_x,stance_y,stance_z], [0,0,0], 500)
+
+
+def head_to_search_position():
+    print("HEAD SEARCH HEIGHT \n \n")
+    
+    AK.setPitchRangeMoving((0, 15, 30), -30, -90, -15, 2000)
+
+
+def head_to_high_position():
+    print("HEAD HIGH HEIGHT \n \n")
+    AK.setPitchRangeMoving((0, 15, 15), -60, -45, -75, 100)
+    
+
+def head_to_mid_position():
+    print("HEAD MID HEIGHT \n \n")
+    AK.setPitchRangeMoving((0, 27, 6), -1, 0, -3, 2000)
+    
+
+
+def head_to_low_position(angle=-10):
+    print("HEAD LOW STANCE \n \n")
+    AK.setPitchRangeMoving((0, 27, 0), angle, angle-1, angle+1, 2000)
+    
+
+
+
+
+
+
+
+def hand_above_target(distance, lower=0, upper=5):
+    print("REACHING STANCE \n \n")
+
+    for z in range(lower, upper):
+        response=AK.setPitchRangeMoving((0, distance, z), -90, -85, -95, 2000)
+        if (response is False):
+            pass
+        else:
+            return response[1]
+            break
+    return False
+
+
+    
+
+
+def getAreaMaxContour(contours):
+    contour_area_temp = 0
+    contour_area_max = 0
+    area_max_contour = None
+
+    for c in contours:  # 历遍所有轮廓
+        contour_area_temp = math.fabs(cv2.contourArea(c))  # 计算轮廓面积
+        if contour_area_temp > contour_area_max:
+            contour_area_max = contour_area_temp
+            if contour_area_temp > 50:  # 只有在面积大于50时，最大面积的轮廓才是有效的，以过滤干扰
+                area_max_contour = c
+
+    return area_max_contour, contour_area_max  # 返回最大的轮廓
+
+
+
+def processContours(masked_image):     
+    opened = cv2.morphologyEx(masked_image, cv2.MORPH_OPEN, np.ones((6,6),np.uint8))  #开运算
+    closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, np.ones((6,6),np.uint8)) #闭运算
+    contours = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[-2]  #找出轮廓
+    areaMaxContour, area_max = getAreaMaxContour(contours)  #找出最大轮廓
+    return areaMaxContour, area_max
+
+
+
+def evaluate_alignment(correction_list, threshold=10):
+    """
+    Good alignment returns True
+    """
+    meanCorrection = int(round(np.mean(correction_list)))
+    if(abs(meanCorrection)<=threshold):
+        return True
+    else:
+        return False
+
+
+def correct_horizontal_alignment(correction_list, threshold=10):
+    meanCorrection = int(round(np.mean(correction_list)))
+    print("\n Horizontal Align Off by "+str(meanCorrection)+".\n")
+
+
+    if(meanCorrection>(threshold*2)):
+        pivot_right(3) #Uses Tripod Gate turn 3 degrees
+    elif(meanCorrection>threshold):
+        pivot_right(1)
+    elif(meanCorrection<-(threshold*2)):
+        pivot_left(3)
+    elif(meanCorrection<-threshold):
+        pivot_left(1)
+    else:
+        ik.stand(ik.initial_pos)
+
+def correct_camera_alignment(h_error_list, v_error_list, threshold=10):
+
+# it took me a long time to realize that from the perspective of  the kinematics
+# the x axis is forward and back while y is side to side
+    mean_x_error = int(round(np.mean(v_error_list)))
+    mean_y_error = int(round(np.mean(h_error_list)))
+    if(abs(mean_x_error)>threshold):
+        print("Final Alignment: Hand Camera Off by ("+str(mean_x_error)+", "+str(mean_y_error)+")")
+
+        if(mean_x_error>0):    
+            move_backward(5)
+        else:
+            move_forward(5)
+        alignmentGood=False
+    elif(abs(mean_y_error)>threshold):
+        if(mean_y_error>0):
+            move_right(5)
+        else:
+            move_left(5)
+
+    else:
+        print("\n Final Alignment: Hand Camera Off by ONLY ("+str(mean_x_error)+", "+str(mean_y_error)+").")
+        global stance_x
+        global stance_y
+        old_stance="("+str(stance_x)+", "+str(stance_y)+")"
+        stance_x=stance_x-(mean_x_error/2)
+        stance_y=stance_y-(mean_y_error/2)
+        new_stance="("+str(stance_x)+", "+str(stance_y)+")"
+        print("Changing stance lean from "+old_stance+" to "+new_stance+" to correct for it.\n")
+        ik.moveBody(ik.initial_pos, [stance_x,stance_y,stance_z], [0,0,0], 2000)
+
+    
+
+def contour_analysis(original_image, target_color="HSL_red", dst_image=None, minimumValidContourArea=100):
+    #global target_shape_length, target_shape_list
+    #global x_correction_list, y_correction_list
+    img_h, img_w = original_image.shape[:2]
+    frame_gb = cv2.GaussianBlur(original_image, (3, 3), 3)      
+    
+    if(target_color=="CEILAB_blue"):
+        frame_lab = cv2.cvtColor(frame_gb, cv2.COLOR_BGR2LAB) #Color is now in CEILAB
+        target_mask = cv2.inRange(frame_lab, (0,0,0),(255,140,110)) #blue
+        target_color=(255,0,0) #blue
+        
+    elif(target_color=="CEILAB_green"):
+        frame_lab = cv2.cvtColor(frame_gb, cv2.COLOR_BGR2LAB) #Color is now in CEILAB
+        target_mask = cv2.inRange(frame_lab, (47,0,135),(255,100,255)) #green
+        target_color=(0,255,0) #green
+            
+    elif(target_color=="CEILAB_violet"):
+        frame_lab = cv2.cvtColor(frame_gb, cv2.COLOR_BGR2LAB) #Color is now in CEILAB
+        target_mask = cv2.inRange(frame_lab, (0,135,0),(130,255,130)) #violet
+        target_color=(255,0,255) #violet
+
+    elif(target_color=="CEILAB_red"):
+        frame_lab = cv2.cvtColor(frame_gb, cv2.COLOR_BGR2HLS) #Color is now in CEILAB
+        target_mask = cv2.inRange(frame_lab, (0,60,100),(255,255,255)) #red
+        target_color=(0,0,255) #red
+
+
+        
+    else: #HSL red
+        frame_lab = cv2.cvtColor(frame_gb, cv2.COLOR_BGR2HLS) #Color is now in Hue Saturation Light (HSL) OpenCV calls it HLS
+        upper_target_mask = cv2.inRange(frame_lab, (0,100,20),(5,255,255))
+        lower_target_mask = cv2.inRange(frame_lab, (160,100,20),(179,255,255))
+        target_mask=upper_target_mask+lower_target_mask
+        target_color=(0,0,555)
+    
+    if(dst_image is None):
+        target_image=original_image
+    else:
+        target_image=dst_image
+    targetX=0
+    targetY=0
+    target_x_from_center=0
+    target_y_from_center=0
+    targetRadius=0
+    targetArea=0
+    maxTargetContour = None
+    
+    approximate_shape_curve=None
+    maxTargetContour, targetArea = processContours(target_mask)
+    if targetArea > minimumValidContourArea:
+        (targetX, targetY), targetRadius = cv2.minEnclosingCircle(maxTargetContour)
+        target_x_from_center=round(targetX-WIDTH/2)
+        target_y_from_center=round(targetY-HEIGHT/2)
+        cv2.drawContours(target_image, maxTargetContour, -1, target_color, 2)
+        epsilon = 0.035 * cv2.arcLength(maxTargetContour, True)
+        approximate_shape_curve = cv2.approxPolyDP(maxTargetContour, epsilon, True)
+    return target_image, maxTargetContour, targetArea, (target_x_from_center, target_y_from_center), targetRadius
+
+
+
+
+
+def get_object(camera_test=False):
+    move_st = True
+
+    param_data = np.load(calibration_param_path + '.npz')
+
+    mtx = param_data['mtx_array']
+    dist = param_data['dist_array']
+    fcam=1
+    newcameramtx, _ = cv2.getOptimalNewCameraMatrix(mtx, dist, (WIDTH, HEIGHT), 0, (WIDTH, HEIGHT))
+    mapx, mapy = cv2.initUndistortRectifyMap(mtx, dist, None, newcameramtx, (WIDTH, HEIGHT), 5)
+
+    
+    HWSONAR.setRGBMode(0)
+    HWSONAR.setRGB(1, (0,0,0))
+    HWSONAR.setRGB(2, (0,0,0))
+    
+    my_camera = Camera.Camera()
+    my_camera.camera_open()
+    
+    horizontal_correction_list=[]
+    vertical_correction_list=[]
+    contour_size_list=[]
+    
+
+    
+    class Hexapod_State(Enum):
+        Initial=0
+        Find_Target=1
+        Initial_Align=2
+        Approach_Camera_Range=3
+        #Camera_Realign and Sonar_Realign are different states because they exit into different states
+        Camera_Realign=4
+        Approach_Sonar_Range=5
+        Sonar_Realign=6
+        At_Target=7
+        Camera_Over_Target=8
+        At_Target_Aligning=9
+        At_Target_Aligned=10
+        Target_In_Hand=11
+        
+    global task_tracker
+    task_tracker=Hexapod_State.Initial
+
+    def change_task(new_task):
+        global task_tracker
+        old_task=task_tracker
+        task_tracker=new_task
+        print("---\n CHANGED FROM "+str(old_task.name)+" TO "+ str(task_tracker)+"\n---")
+        
+    image_loop_iterator=0
+    arm_range_threshold=100
+    #A Sonar reading of 100 was chosen because the it corresponds to a relatively linear measurement region within our test of sonar reading vs claw
+    # there is unexpected non linear behavior shortly farther away
+    sonar_range_threshold=20000
+
+    try:
+        load_sonar_to_arm()
+    except:
+        train_sonar_to_arm()
+        
+    if(not camera_test):
+        upright_stance()
+        head_to_search_position()
+        open_gripper()
+    change_task(Hexapod_State.Find_Target)
+    error_threshold_initial=10
+    error_threshold_camera=20
+    error_threshold_sonar=25
+    error_threshold_arm=10
+    
+    #Any Time a State Change occures, I call continue to make sure the State Execution Step does not execute for that new state until the next iteration of the State Execution Step
+    while True:
+                                
+        img = my_camera.frame 
+        if img is not None:
+            #ik.stand(ik.initial_pos, t=500)
+            image_loop_iterator=image_loop_iterator+1
+            frame = img.copy()
+            frame = cv2.remap(frame, mapx, mapy, cv2.INTER_LINEAR)  # 畸变矫正
+            targeted_frame, target_contour, target_contour_area, (target_x_from_center, target_y_from_center), target_contour_radius =  contour_analysis(frame, "CEILAB_red", copy.copy(frame))
+            
+    
+            #print("Target: ("+str(target_x_from_center)+", "+str(target_y_from_center)+")")
+            horizontal_correction_list.append(target_x_from_center)
+            vertical_correction_list.append(target_y_from_center)
+            contour_size_list.append(target_contour_area)
+            resize_frame=cv2.resize(targeted_frame,(1280,960))
+            resize_frame=cv2.circle(resize_frame,(WIDTH,HEIGHT), 5, (0, 0, 0),5)
+            cv2.imshow('Frame', resize_frame)
+            #time.sleep(1.0)
+
+            if(image_loop_iterator>10 and (not camera_test)):  #State Execution Step
+                print(task_tracker.name)
+                temp_horizontal_correction_list=horizontal_correction_list
+                temp_vertical_correction_list=vertical_correction_list
+                horizontal_correction_list=[]
+                vertical_correction_list=[]
+
+                temp_contour_size_list=contour_size_list
+                contour_size_list=[]
+                image_loop_iterator=0
+                contour_size = int(round(np.mean(temp_contour_size_list)))
+                if(task_tracker.value<Hexapod_State.Approach_Sonar_Range.value):print("Contour Size: "+str(target_contour_area))
+                if(task_tracker is Hexapod_State.Find_Target):
+                    if(contour_size>100): change_task(Hexapod_State.Initial_Align)
+                    continue #Skip rest of steps regardless of outcome
+                
+                #Alignment Steps
+                if(task_tracker is Hexapod_State.Initial_Align):
+                    if(evaluate_alignment(temp_horizontal_correction_list,error_threshold_initial)): #If target is centered in x direction of picture
+                        partial_crouch_stance()
+                        head_to_low_position(-15)
+                        change_task(Hexapod_State.Approach_Camera_Range)
+                        continue
+                    else:
+                        correct_horizontal_alignment(temp_horizontal_correction_list,error_threshold_initial)
+                        continue
+                elif(task_tracker is Hexapod_State.Camera_Realign):
+                    if(evaluate_alignment(temp_horizontal_correction_list)): #If target is centered in x direction of picture
+                        change_task(Hexapod_State.Approach_Camera_Range)
+                        continue 
+                    else:
+                        correct_horizontal_alignment(temp_horizontal_correction_list)
+                        continue
+                
+                elif(task_tracker is Hexapod_State.Sonar_Realign):
+                    if(evaluate_alignment(temp_horizontal_correction_list)): #If target is centered in x direction of picture
+                        change_task(Hexapod_State.Approach_Sonar_Range)
+                        continue         
+                    else:
+                        correct_horizontal_alignment(temp_horizontal_correction_list)
+                        continue
+            
+            
+                elif(task_tracker is Hexapod_State.Camera_Over_Target):
+                    if (evaluate_alignment(temp_horizontal_correction_list) and evaluate_alignment(temp_vertical_correction_list)):
+                        print("CLAW ALIGNED WITH TARGET WITH ONLY ("+str(np.mean(temp_horizontal_correction_list))+", "+str(np.mean(temp_vertical_correction_list))+") Error!")
+                        change_task(Hexapod_State.At_Target_Aligned) #It put out its arm and had perfect alignment so it can skip the Arm Aligning Phase
+                        continue
+                    else:
+                        change_task(Hexapod_State.At_Target_Aligning) #It is entering the Arm Aligning Phase after puting out its arm
+                        continue
+                elif(task_tracker is Hexapod_State.At_Target_Aligning):
+                    #print("Camera Alignment On Arm")
+                    if (evaluate_alignment(temp_horizontal_correction_list) and evaluate_alignment(temp_vertical_correction_list)):
+                        print("CLAW ALIGNED WITH TARGET WITH ONLY ("+str(np.mean(temp_horizontal_correction_list))+", "+str(np.mean(temp_vertical_correction_list))+") Error!")
+                        change_task(Hexapod_State.At_Target_Aligned) #Fixed Alighment
+                        continue
+                    else:
+                        correct_camera_alignment(temp_horizontal_correction_list, temp_vertical_correction_list)
+                        continue
+                
+                elif(task_tracker.value < Hexapod_State.Approach_Sonar_Range.value):
+                    if(not evaluate_alignment(temp_horizontal_correction_list, error_threshold_camera)): 
+                        change_task(Hexapod_State.Camera_Realign)
+                        continue
+                elif(task_tracker.value < Hexapod_State.At_Target.value):
+                    if(not evaluate_alignment(temp_horizontal_correction_list, error_threshold_sonar)): 
+                        change_task(Hexapod_State.Sonar_Realign)
+                        continue
+
+                if(contour_size>sonar_range_threshold):
+                    if(task_tracker is Hexapod_State.Approach_Camera_Range):
+                        change_task(Hexapod_State.Approach_Sonar_Range)
+                        continue
+                    
+                if(task_tracker is Hexapod_State.Approach_Sonar_Range):
+                    crouch_stance()
+                    head_to_high_position() #Walking changes position so this must be called each time before getting distance with sonar if walking would have occured
+                    distance=get_distance_with_sonar()                          
+                    if((distance<arm_range_threshold) and (sonar_to_arm_function(distance)<25.0)):
+                        change_task(Hexapod_State.At_Target)
+                    else:
+                        move_forward(25)
+                    continue
+                
+                if(task_tracker is Hexapod_State.At_Target_Aligned):
+                    lowered_stance_to_grab()
+                    grip_gripper()
+                    time.sleep(1.0)
+                    upright_stance()
+                    time.sleep(1.0)
+                    print("Did I get it?")
+                    key = cv2.waitKey(0)
+                    if key==27:  # press escape
+                        
+                        change_task(Hexapod_State.Target_In_Hand)  
+                        break
+                    else:
+                        print("Input: "+str(key))
+                        change_task(Hexapod_State.At_Target)
+                        continue
+
+                   
+                
+                if(task_tracker is Hexapod_State.At_Target):
+                    #Reach out arm to the target
+                    crouch_stance()
+                    head_to_high_position() #Walking changes position so this must be called each time before getting distance with sonar if walking would have occured
+                    distance=get_distance_with_sonar()                          
+                    upright_stance()
+                    arm_moved=hand_above_target(sonar_to_arm_function(distance))
+                    if(arm_moved is False):
+                        print("Cound Not Move Arm to Y Postion "+str(sonar_to_arm_function(distance))+" corresponding by Sonar Distance "+str(distance))
+                        if(distance>150):
+                            change_task(Hexapod_State.Approach_Sonar_Range)
+                        elif(distance>50):
+                            move_forward(3)
+                        else:
+                            move_backward(3)
+
+                    else:
+                        task_tracker=Hexapod_State.Camera_Over_Target
+                    continue
+
+                if(task_tracker is Hexapod_State.Approach_Camera_Range):
+                    move_forward(25)
+                if(task_tracker is Hexapod_State.Approach_Sonar_Range):
+                    move_forward(25)
+
+        
+        else:
+            time.sleep(0.01)
+        key = cv2.waitKey(1)
+
+        if key ==-1:
+            pass
+        elif key==27:  # press escape
+            break
+        
+        else:
+            print(key)
+            continue
+    my_camera.camera_close()
+    cv2.destroyAllWindows()
+
+
+
+if __name__ == '__main__':
+ #   move_forward(20)
+  #  move_forward_crouched(20)
+   
+#move_forward(10)
+    get_object()
+
+    #open_gripper()
+    
+    
+    
+    #raised_stance()
+    #lowered_stance_to_grab()
+
+
+
+
+
+
